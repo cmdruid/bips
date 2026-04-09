@@ -1,0 +1,396 @@
+<pre>
+  BIP: 395
+  Layer: Applications
+  Title: Quantum-Insured Extended Keys for BIP 32
+  Authors: Christopher Scott <cscottdev@protonmail.com>
+  Status: Draft
+  Type: Specification
+  Created: 2026-04-04
+  License: BSD-3-Clause
+  Requires: 32, 39, 341, 342, 368, 369
+</pre>
+
+==Introduction==
+
+===Abstract===
+
+This document extends the [[bip-0032.mediawiki|BIP 32]] extended key serialization format to include SPHINCS+ key material for quantum-insured Taproot addresses. Two new version prefixes, <code>qpub</code> and <code>qprv</code>, encode a standard BIP 32 extended key alongside a SPHINCS+ keypair. A watch-only wallet holding a <code>qpub</code> can derive quantum-insured Taproot addresses without access to any private key material.
+
+===Copyright===
+
+This document is licensed under the 3-clause BSD license.
+
+===Motivation===
+
+[[bip-0369.mediawiki|BIP 369]] enables SPHINCS+ post-quantum signature verification in Tapscript. Users can create Taproot outputs with a hidden SPHINCS+ tapleaf today, providing "quantum insurance" that becomes enforceable if the soft fork activates.
+
+For this strategy to work at scale, wallets need to:
+
+# '''Derive quantum-insured addresses''' from an extended public key, so that merchants, exchanges, and watch-only wallets can generate receiving addresses without private key access.
+# '''Reuse a single SPHINCS+ public key''' across multiple addresses in an account, since SPHINCS+ is a stateless scheme and key reuse does not weaken its security — unlike stateful hash-based schemes (XMSS) where reuse is catastrophic.
+# '''Maintain account isolation''' so that compromise of one SPHINCS+ key does not affect other accounts.
+# '''Enable efficient key-path spending''' for normal operation, reserving the SPHINCS+ tapleaf for post-quantum emergencies.
+
+This BIP achieves all four by bundling a per-account SPHINCS+ public key into the BIP 32 extended key serialization. The BIP 32 child key serves as both the internal key (for key-path spending) and the Schnorr key in the hybrid tapleaf. The SPHINCS+ component of the tapleaf is constant across all addresses in the account.
+
+==Design==
+
+===Address construction===
+
+Each quantum-insured Taproot address is constructed with the BIP 32 child key as the internal key (enabling efficient key-path spending) and a single hybrid tapleaf that requires both Schnorr and SPHINCS+ signatures:
+
+<source>
+Internal key: <child_schnorr_pk>    (BIP 32 derived, per address)
+MAST tree:
+  Leaf A: <sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP <child_schnorr_pk> OP_CHECKSIG
+</source>
+
+Where:
+* <code>child_schnorr_pk</code> is the x-only public key derived via [[bip-0032.mediawiki|BIP 32]] at the child index.
+* <code>sphincs_pk</code> is the 32-byte SPHINCS+ public key from the extended key (constant for all addresses in the account).
+
+The output key is computed as:
+
+<source>
+leaf_hash   = TapLeaf(0xC0, <sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP <child_schnorr_pk> OP_CHECKSIG)
+merkle_root = leaf_hash    (single leaf)
+Q = child_schnorr_pk + hash(TapTweak, bytes(child_schnorr_pk) || merkle_root) * G
+</source>
+
+===Spending paths===
+
+====Normal operation (key-path)====
+
+Spend via key-path using a Schnorr signature for the output key <code>Q</code>. This is the most efficient Taproot spend (~64 bytes witness). The hybrid tapleaf is never revealed on-chain.
+
+Post-[[bip-0368.mediawiki|BIP 368]] activation, key-path spending requires an annex disclosing the internal key: <code>0x50 || 0x02 || child_schnorr_pk || merkle_root</code> (66 bytes). The total witness cost is ~130 bytes (signature + annex).
+
+====Post-quantum emergency (script-path, hybrid leaf)====
+
+If a quantum threat materializes and [[bip-0369.mediawiki|BIP 369]] is activated, spend via the hybrid tapleaf. This requires '''both''' a valid SPHINCS+ signature (in the annex) '''and''' a valid Schnorr signature (in the witness):
+
+<source>
+witness: [schnorr_sig] [script] [control_block] [annex]
+</source>
+
+Where:
+* <code>schnorr_sig</code> satisfies <code>OP_CHECKSIG</code>.
+* <code>annex</code> carries the SPHINCS+ signature: <code>0x50 || 0x04 || compact_size(1) || sphincs_sig</code>.
+* <code>script</code> and <code>control_block</code> are the hybrid tapleaf and Merkle proof.
+
+An attacker must break '''both''' Schnorr and SPHINCS+ simultaneously to spend via this path.
+
+====Pre-activation safety====
+
+The hybrid script is safe pre-activation because <code>OP_CHECKSPHINCSVERIFY</code> (<code>OP_NOP4</code>) is a no-op, but <code>OP_CHECKSIG</code> still enforces Schnorr signature verification:
+
+<source>
+Pre-activation evaluation:
+  <sphincs_pk>         → push pubkey
+  OP_NOP4              → does nothing
+  OP_DROP              → removes pubkey
+  <child_schnorr_pk>   → push pubkey
+  OP_CHECKSIG          → validates Schnorr signature (ALWAYS enforced)
+</source>
+
+The <code>sphincs_pk</code> is embedded in the <code>qpub</code>, which may be shared publicly for watch-only address generation. The <code>OP_CHECKSIG</code> in the hybrid script ensures that knowledge of the <code>qpub</code> alone is never sufficient to spend funds.
+
+===SPHINCS+ key reuse===
+
+The SPHINCS+ keypair is generated once per account (one per BIP 32 account level, e.g., <code>m/395'/0'/0'</code>). All addresses derived from the same <code>qpub</code> share the same SPHINCS+ public key in their hybrid tapleaf.
+
+This is safe because:
+
+* '''SPHINCS+ is stateless.''' Unlike XMSS, SPHINCS+ (SLH-DSA) does not maintain signing state. The same key can produce an unlimited number of signatures without security degradation. Key reuse does not weaken the cryptographic guarantees.
+* '''Each UTXO gets a unique sighash.''' Even though the SPHINCS+ public key is the same across addresses, each spending transaction produces a unique sighash (bound to input index, prevout, amounts, etc.). Signatures are not replayable across UTXOs.
+* '''Account isolation is preserved.''' Each BIP 32 account has its own SPHINCS+ keypair. Compromise of one account's SPHINCS+ key does not affect other accounts.
+
+===Key generation===
+
+The SPHINCS+ keypair '''should''' be derived deterministically from the wallet's [[bip-0032.mediawiki|BIP 32]] master extended private key so that it can be recovered from the same seed material. The recommended derivation uses HMAC-SHA512 with the full master extended key and account path:
+
+<source>
+I                  = HMAC-SHA512("Bitcoin seed", seed)  // standard BIP 32 master key generation
+master_ext_privkey = I                                  // 64 bytes: privkey (32) || chaincode (32)
+account_path_bytes = serialize_bip32_path(m/395'/coin_type'/account')
+sphincs_material   = HMAC-SHA512("Sphincs seed", master_ext_privkey || account_path_bytes)
+
+sk_seed = sphincs_material[0:16]     // Secret seed for internal hash tree
+sk_prf  = sphincs_material[16:32]    // PRF key for randomized message hashing
+pk_seed = sphincs_material[32:48]    // Public seed
+
+(sk, pk) = SphincsKeygen(sk_seed, sk_prf, pk_seed)
+// sk: 64 bytes (sk_seed || sk_prf || pk_seed || pk_root)
+// pk: 32 bytes (pk_seed || pk_root)
+</source>
+
+Where <code>master_ext_privkey</code> is the full 64-byte output of [[bip-0032.mediawiki|BIP 32]] master key generation: the 32-byte master private key followed by the 32-byte master chain code. Both components are secret material (the chain code is only present in the extended private key, never in publicly-exported account-level extended public keys).
+
+The HMAC key <code>"Sphincs seed"</code> provides domain separation from BIP 32 (which uses <code>"Bitcoin seed"</code>). The account path bytes use [[bip-0032.mediawiki|BIP 32]] serialization: each derivation level is a 4-byte big-endian unsigned integer, with bit <code>0x80000000</code> set for hardened indices, concatenated without separators. For example, <code>m/395'/0'/0'</code> encodes as <code>0x8000018B || 0x80000000 || 0x80000000</code> (12 bytes).
+
+This derivation is secure because the master extended private key is protected behind hardened BIP 32 derivation levels. A quantum adversary who compromises a non-hardened child key (or an account-level xpub) cannot cross the hardened boundary to reach the master key, and therefore cannot derive the SPHINCS+ key.
+
+Wallets '''may''' also accept externally-generated (random) SPHINCS+ keys via import for advanced use cases.
+
+===Backup===
+
+When the SPHINCS+ key is derived from the master private key (recommended), the wallet's seed material (e.g., [[bip-0039.mediawiki|BIP 39]] mnemonic) is the '''only''' backup needed. Both the BIP 32 key hierarchy and the SPHINCS+ keypair can be recovered from the seed.
+
+When an externally-generated SPHINCS+ key is imported, the backup consists of the seed '''plus''' the SPHINCS+ secret key (64 bytes) or equivalently the <code>qprv</code>.
+
+==Specification==
+
+===Serialization format===
+
+Quantum-insured extended keys extend the [[bip-0032.mediawiki|BIP 32]] 78-byte serialization with appended SPHINCS+ key material:
+
+====qpub (quantum-insured extended public key)====
+
+{| class="wikitable"
+|-
+! Bytes !! Field !! Description
+|-
+| 4 || version || <code>0x064A0000</code> (mainnet qpub, base58 prefix <code>Q1</code>)
+|-
+| 1 || depth || BIP 32 depth
+|-
+| 4 || fingerprint || Parent key fingerprint
+|-
+| 4 || child number || BIP 32 child number
+|-
+| 32 || chain code || BIP 32 chain code
+|-
+| 33 || public key || Compressed secp256k1 public key
+|-
+| 32 || sphincs pubkey || SPHINCS+ public key (pk_seed &#124;&#124; pk_root)
+|}
+
+Total: '''110 bytes''' (78 + 32), encoded as base58check.
+
+====qprv (quantum-insured extended private key)====
+
+{| class="wikitable"
+|-
+! Bytes !! Field !! Description
+|-
+| 4 || version || <code>0x152C0000</code> (mainnet qprv, base58 prefix <code>Q1</code>)
+|-
+| 1 || depth || BIP 32 depth
+|-
+| 4 || fingerprint || Parent key fingerprint
+|-
+| 4 || child number || BIP 32 child number
+|-
+| 32 || chain code || BIP 32 chain code
+|-
+| 33 || private key || <code>0x00</code> &#124;&#124; 32-byte secp256k1 private key
+|-
+| 64 || sphincs secret key || SPHINCS+ secret key (sk_seed &#124;&#124; sk_prf &#124;&#124; pk_seed &#124;&#124; pk_root)
+|}
+
+Total: '''142 bytes''' (78 + 64), encoded as base58check.
+
+====Version bytes====
+
+{| class="wikitable"
+|-
+! Network !! Type !! Version bytes !! Base58 prefix
+|-
+| Mainnet || qpub || <code>0x064A0000</code> || <code>Q1...</code>
+|-
+| Mainnet || qprv || <code>0x152C0000</code> || <code>Q1...</code>
+|-
+| Testnet || qpub || <code>0x07200000</code> || <code>T4...</code>
+|-
+| Testnet || qprv || <code>0x18000000</code> || <code>T5...</code>
+|}
+
+Version bytes were chosen to produce recognizable base58 prefixes for the 110-byte (qpub) and 142-byte (qprv) payload sizes. Both mainnet types share the <code>Q1</code> prefix; testnet uses <code>T4</code> (public) and <code>T5</code> (private). Deserializers distinguish mainnet <code>qpub</code> from <code>qprv</code> by payload size: 110 bytes (qpub) vs 142 bytes (qprv). Implementations '''must''' validate the payload size after detecting the version prefix.
+
+===Purpose and derivation path===
+
+Quantum-insured wallets use purpose <code>395'</code> (matching this BIP's assigned number). The recommended derivation path is:
+
+<source>
+m / 395' / coin_type' / account' / change / index
+</source>
+
+Where:
+* <code>395'</code> is the purpose (hardened).
+* <code>coin_type'</code> is per [[https://github.com/satoshilabs/slips/blob/master/slip-0044.md|SLIP-44]] (e.g., <code>0'</code> for Bitcoin mainnet, <code>1'</code> for testnet).
+* <code>account'</code> is the account index (hardened). Each account has its own SPHINCS+ keypair.
+* <code>change</code> is <code>0</code> for external (receiving) or <code>1</code> for internal (change).
+* <code>index</code> is the address index.
+
+The SPHINCS+ keypair is derived once at the account level (<code>m/395'/coin_type'/account'</code>) and shared across all child addresses.
+
+A <code>qpub</code> is typically exported at the account level: <code>m/395'/0'/0'</code>. Non-hardened child derivation produces addresses at <code>m/395'/0'/0'/0/0</code>, <code>m/395'/0'/0'/0/1</code>, etc.
+
+Using a distinct purpose index (<code>395'</code>) avoids collisions with non-quantum-insured wallets that may use the same seed with purpose <code>86'</code> ([[bip-0086.mediawiki|BIP 86]]). Both can coexist in the same wallet with different purpose paths.
+
+===BIP 32 derivation===
+
+Child key derivation follows standard [[bip-0032.mediawiki|BIP 32]] rules applied to the secp256k1 key and chain code. The SPHINCS+ key material is '''not''' derived — it is carried unchanged through all derivation levels.
+
+Given a parent <code>qpub</code> at depth <code>d</code>:
+* '''Non-hardened child <code>i</code>''': derive child secp256k1 public key and chain code per BIP 32. The child <code>qpub</code> has the same SPHINCS+ public key, depth <code>d+1</code>, and child number <code>i</code>.
+* '''Hardened child''': requires the <code>qprv</code>. Derive child secp256k1 private key and chain code per BIP 32. The child <code>qprv</code> has the same SPHINCS+ secret key.
+
+<source>
+def DeriveChildQPub(parent_qpub, index):
+    # Standard BIP 32 public child derivation
+    child_xpub = BIP32_CKDpub(parent_qpub.xpub_component, index)
+
+    # SPHINCS+ key is unchanged
+    child_qpub = QExtPubKey(
+        version     = QPUB_VERSION,
+        depth       = parent_qpub.depth + 1,
+        fingerprint = parent_qpub.fingerprint(),
+        child_num   = index,
+        chain_code  = child_xpub.chain_code,
+        pubkey      = child_xpub.pubkey,
+        sphincs_pk  = parent_qpub.sphincs_pk   # unchanged
+    )
+    return child_qpub
+</source>
+
+===Address derivation from qpub===
+
+Given a <code>qpub</code> and child index <code>i</code>:
+
+<source>
+def DeriveQuantumInsuredAddress(qpub, index):
+    # Step 1: BIP 32 derive child Schnorr key
+    child_qpub = DeriveChildQPub(qpub, index)
+    child_xonly = XOnlyPubKey(child_qpub.pubkey)
+
+    # Step 2: Construct the hybrid tapleaf script
+    script = [qpub.sphincs_pk, OP_CHECKSPHINCSVERIFY, OP_DROP,
+              child_xonly, OP_CHECKSIG]
+
+    # Step 3: Compute leaf hash and merkle root (single leaf)
+    leaf_hash   = TapLeaf(TAPSCRIPT_LEAF_VERSION, script)
+    merkle_root = leaf_hash
+
+    # Step 4: Compute output key with child key as internal key
+    Q = child_xonly + hash(TapTweak, bytes(child_xonly) || merkle_root) * G
+
+    # Step 5: Encode as bech32m Taproot address
+    return bech32m_encode("bc", 1, bytes(Q))
+</source>
+
+==qr() Output Descriptor==
+
+The <code>qr()</code> output descriptor defines a quantum-insured Taproot output using a <code>qpub</code> or <code>qprv</code> extended key:
+
+<source>
+qr(KEY)
+qr(KEY, SCRIPT_TREE)
+</source>
+
+Where <code>KEY</code> is a <code>qpub</code> or <code>qprv</code> with optional [[bip-0032.mediawiki|BIP 32]] derivation path (e.g., <code>qr(Q1.../0/*)</code>). The descriptor auto-constructs a hybrid SPHINCS+ tapleaf using the derived EC child key and the SPHINCS+ pubkey from the extended key.
+
+<code>qr()</code> is a drop-in replacement for <code>tr()</code>. Where <code>tr(xpub/0/*)</code> produces a plain Taproot output, <code>qr(qpub/0/*)</code> produces a quantum-insured Taproot output with the hybrid tapleaf included automatically.
+
+===Expansion===
+
+At child index <code>i</code>:
+
+<source>
+child_xonly    = BIP32_Derive(qpub.xpub, i)
+hybrid_script  = <qpub.sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP
+                 <child_xonly> OP_CHECKSIG
+leaf_hash      = TapLeaf(0xC0, hybrid_script)
+Q = child_xonly + hash(TapTweak, bytes(child_xonly) || leaf_hash) * G
+</source>
+
+If a <code>SCRIPT_TREE</code> is provided, the hybrid leaf is prepended to the user-supplied tree:
+
+<source>
+qr(qpub/0/*, pk(OTHER_KEY))
+→ Taproot tree: { hybrid_leaf, pk(OTHER_KEY) }
+</source>
+
+===Example===
+
+<source>
+qr(Q1CFYH2UTfN9JFK.../0/*)
+</source>
+
+This produces a range of quantum-insured Taproot addresses, each with the same SPHINCS+ public key in the hybrid tapleaf and a unique BIP 32 child key as the internal key.
+
+===Relation to qis()===
+
+For advanced use cases requiring custom Taproot trees with explicit key control, the <code>qis()</code> script fragment remains available:
+
+<source>
+tr(xpub/0/*, qis(SPHINCS_HEX, xpub/0/*))
+</source>
+
+<code>qr()</code> is the recommended descriptor for standard quantum-insured wallets. <code>qis()</code> is retained for power users who need full control over the internal key, tree structure, or key sources.
+
+==Backward Compatibility==
+
+Quantum-insured extended keys use new version bytes that are distinct from all existing BIP 32 version prefixes (xpub/xprv, ypub/yprv, zpub/zprv). Software that does not recognize the new version bytes will reject the key with an appropriate error, rather than silently misinterpreting it.
+
+A <code>qpub</code> can be "downgraded" to a standard <code>xpub</code> by stripping the SPHINCS+ public key and changing the version bytes. The resulting <code>xpub</code> derives the same secp256k1 child keys but cannot construct quantum-insured addresses.
+
+Addresses derived from a <code>qpub</code> are standard Taproot (witness version 1) addresses. They are indistinguishable on-chain from any other Taproot output. No changes to address encoding or transaction format are required.
+
+==Security Considerations==
+
+===Master-key-derived SPHINCS+ keys===
+
+When the recommended derivation is used, the SPHINCS+ key is derived from the BIP 32 master extended private key via <code>HMAC-SHA512("Sphincs seed", master_ext_privkey || account_path)</code>. The domain tag <code>"Sphincs seed"</code> ensures this is cryptographically independent from BIP 32's <code>HMAC-SHA512("Bitcoin seed", seed)</code>.
+
+A quantum adversary who compromises a non-hardened child key (or account-level xpub) via Shor's algorithm cannot cross the hardened derivation boundary to reach the master extended private key. Therefore they cannot derive the SPHINCS+ key. The master key is protected by hardened BIP 32 derivation (which uses private keys in the hash, not public keys). The master chain code, while present in the master xprv, is never exposed in account-level xpubs — it is a distinct value from any child chain code.
+
+===Key-path race condition (accepted risk)===
+
+Post-[[bip-0368.mediawiki|BIP 368]] activation, if the user spends via the hybrid tapleaf (revealing the internal key <code>P</code> in the control block), a quantum adversary could recover <code>P</code>'s private key and attempt a competing key-path spend. This creates a race between the user's SPHINCS+ transaction and the attacker's key-path transaction in the mempool.
+
+This risk is accepted for the following reasons:
+
+* '''Key-path efficiency:''' The construction enables ~64 byte key-path spends for normal operation, saving ~66 bytes per transaction compared to the NUMS alternative.
+* '''Narrow attack window:''' The race only occurs during the time between the user's transaction entering the mempool and being confirmed. The attacker must run Shor's algorithm on the internal key and construct a competing transaction within this window.
+* '''Q-day threat model:''' Early quantum attacks are expected to target long-exposed public keys (e.g., P2PK outputs, reused addresses), not transactions in the mempool with a sub-minute exposure window. Mempool-speed quantum attacks represent a significantly more advanced threat level.
+* '''Defense in depth:''' Even if the attacker wins the race, they can only key-path spend — they cannot forge SPHINCS+ signatures to spend via the hybrid leaf. The hybrid leaf provides a strictly stronger security guarantee than key-path alone.
+
+Users who require unconditional protection against key-path attacks (even mempool-speed quantum) should use the NUMS internal key construction described in [[bip-0369.mediawiki|BIP 369]] instead of this BIP's construction.
+
+===SPHINCS+ key compromise scope===
+
+If a SPHINCS+ secret key is compromised, all addresses in that account (derived from the same <code>qpub</code>) are affected. The blast radius is limited to one BIP 32 account. Other accounts with different SPHINCS+ keys are unaffected.
+
+===Pre-activation tapleaf safety===
+
+The hybrid script always requires a valid Schnorr signature via <code>OP_CHECKSIG</code>, even when <code>OP_CHECKSPHINCSVERIFY</code> is treated as <code>OP_NOP4</code> pre-activation.
+
+===Watch-only privacy===
+
+A <code>qpub</code> reveals the SPHINCS+ public key, which is shared across all addresses in the account. An observer who obtains the <code>qpub</code> can identify all quantum-insured addresses belonging to that account by checking which on-chain outputs contain the corresponding hybrid tapleaf hash in their Merkle tree. However, this requires knowledge of the <code>qpub</code> — the hybrid tapleaf is never revealed on-chain during normal key-path spending.
+
+===SPHINCS+ tapleaf clustering===
+
+If the user spends via the hybrid tapleaf (e.g., during a post-activation quantum emergency), the <code>sphincs_pk</code> is revealed on-chain as part of the script. Since the same <code>sphincs_pk</code> appears in every address derived from the same <code>qpub</code>, an observer can scan the blockchain for other outputs containing the same tapleaf hash. This links all addresses in the account.
+
+This privacy risk is acceptable for the intended use case: the hybrid tapleaf is the '''emergency''' spending path, used during a "q-day" event when the user is sweeping funds. In this scenario, the user is likely spending all UTXOs in the account in a short period, and the privacy loss from tapleaf clustering is minor compared to the fund-safety benefit. During normal operation (key-path spending), the tapleaf is never revealed and no clustering is possible.
+
+===Backup failure (imported keys only)===
+
+When the SPHINCS+ key is derived from the BIP 39 seed, the mnemonic is sufficient to recover everything. When an imported SPHINCS+ key is used and its backup is lost, the user can still spend via key-path (Schnorr) under normal conditions. Funds are only at risk if the SPHINCS+ key is lost ''and'' a quantum attack makes Schnorr spending impossible.
+
+==Test Vectors==
+
+Planned test vectors for this draft include:
+
+* '''Key derivation''': BIP 39 seed + account path → SPHINCS+ keypair (sk_seed, sk_prf, pk_seed, expected public key).
+* '''Serialization''': example <code>qpub</code> and <code>qprv</code> with all fields, base58check encoding, and round-trip verification.
+* '''Child derivation''': parent <code>qpub</code>, child index, expected child <code>qpub</code> (secp256k1 key changes, SPHINCS+ key unchanged).
+* '''Address generation''': <code>qpub</code> + child index → expected Taproot address, showing intermediate values (child x-only key, hybrid script, leaf hash, merkle root, output key Q).
+* '''Downgrade''': <code>qpub</code> → <code>xpub</code> conversion, verifying secp256k1 key identity.
+* '''Cross-account isolation''': two accounts with different SPHINCS+ keys, same child index, producing different addresses.
+
+==Reference Implementation==
+
+A reference implementation will be provided alongside the [[bip-0369.mediawiki|BIP 369]] wallet support implementation on the Bitcoin Core <code>quantroot</code> branch.

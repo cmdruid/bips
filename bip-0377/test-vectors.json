@@ -1,0 +1,80 @@
+{
+  "description": "Test vectors for PSBT Extensions for SPHINCS+ and Annex Data (BIP 377)",
+  "field_types": {
+    "input": {
+      "PSBT_IN_TAP_SPHINCS_PUB": {
+        "type_byte": "0x1d",
+        "key_data": "<32B xonly_pubkey><32B leaf_hash>",
+        "value_data": "<32B sphincs_pubkey>",
+        "key_size": 65,
+        "value_size": 32
+      },
+      "PSBT_IN_TAP_SPHINCS_SIG": {
+        "type_byte": "0x1e",
+        "key_data": "<32B xonly_pubkey><32B leaf_hash>",
+        "value_data": "<4080B sphincs_signature>",
+        "key_size": 65,
+        "value_size": 4080
+      },
+      "PSBT_IN_TAP_ANNEX": {
+        "type_byte": "0x1f",
+        "key_data": "none",
+        "value_data": "<annex_bytes>",
+        "key_size": 1,
+        "note": "Value is raw annex bytes including 0x50 prefix"
+      }
+    },
+    "output": {
+      "PSBT_OUT_TAP_SPHINCS_PUB": {
+        "type_byte": "0x09",
+        "key_data": "<32B xonly_pubkey><32B leaf_hash>",
+        "value_data": "<32B sphincs_pubkey>",
+        "key_size": 65,
+        "value_size": 32
+      }
+    }
+  },
+  "annex_formats": {
+    "bip368_keypath": {
+      "description": "Key-path internal key disclosure",
+      "type_byte": "0x02",
+      "format_no_tree": "0x50 || 0x02 || P (34 bytes)",
+      "format_with_tree": "0x50 || 0x02 || P || merkle_root (66 bytes)"
+    },
+    "bip369_sphincs": {
+      "description": "SPHINCS+ signatures for script-path",
+      "type_byte": "0x04",
+      "format": "0x50 || 0x04 || compact_size(N) || sig_1 || ... || sig_N",
+      "signature_size": 4080,
+      "note": "Types 0x02 and 0x04 are mutually exclusive per input"
+    }
+  },
+  "signing_workflow": {
+    "hybrid_tapleaf": {
+      "description": "Two-round signing for hybrid tapleaf (SPHINCS+ then Schnorr)",
+      "steps": [
+        "1. SPHINCS+ signer: compute BIP 369 sighash (BIP 342 minus sha_annex, spend_type=0x03)",
+        "2. SPHINCS+ signer: produce 4080-byte signature via SphincsSign",
+        "3. Combiner: build annex (0x50 || 0x04 || compact_size(1) || sphincs_sig)",
+        "4. Schnorr signer: compute BIP 342 sighash (includes sha_annex from step 3)",
+        "5. Schnorr signer: produce 64-byte Schnorr signature",
+        "6. Finalizer: witness = [schnorr_sig] [script] [control_block] [annex]"
+      ],
+      "note": "Public keys are data pushes inside the script, NOT separate witness elements"
+    },
+    "keypath_bip368": {
+      "description": "Single-round key-path signing with BIP 368 annex",
+      "steps": [
+        "1. Build deterministic annex from internal key P (and optional merkle_root)",
+        "2. Compute BIP 341 sighash (includes sha_annex)",
+        "3. Schnorr sign",
+        "4. Finalizer: witness = [schnorr_sig] [annex]"
+      ]
+    }
+  },
+  "witness_layouts": {
+    "keypath_with_annex": "[schnorr_sig:64-65B] [annex:34-66B]",
+    "scriptpath_hybrid": "[schnorr_sig:64-65B] [script] [control_block] [annex]",
+    "note": "Annex is always last witness element, identified by 0x50 prefix"
+  }
+}

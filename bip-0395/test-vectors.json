@@ -1,0 +1,56 @@
+{
+  "description": "Test vectors for Quantum-Insured Extended Keys (BIP 395)",
+  "generated_from": "Bitcoin Core quantroot branch, qextkey_tests/deterministic_test_vector",
+
+  "vector_1": {
+    "description": "Deterministic derivation from known 32-byte seed",
+    "seed_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+
+    "master_key": {
+      "private_key": "555e4b4c8f207577d511189dae933a475e5ec4a33162877370b7724b358c4f30",
+      "chain_code": "22b29dd3ce203995fd130aab8341c1c0c70b7a3f0e64e2875c1eb664418f8e5f",
+      "compressed_pubkey": "039822622cf330b98e52e7357135bc93e1e5606a57a9819408734598fe5677b134"
+    },
+
+    "sphincs_derivation": {
+      "hmac_key": "Sphincs seed",
+      "hmac_data": "master_privkey || master_chaincode || account_path_bytes",
+      "account_path": "m/395'/0'/0'",
+      "account_path_bytes": "8000018B8000000080000000",
+      "sphincs_pubkey": "67ca64e931208105e636c9d9a41fb9406e15e82d03d12e6793b818edcdc87ac8",
+      "sphincs_secret": "be17b06425941744777a905f5bcc6da3a808c4a08c16bdc4cb54ab09b4b397e967ca64e931208105e636c9d9a41fb9406e15e82d03d12e6793b818edcdc87ac8",
+      "note": "sphincs_pubkey == sphincs_secret[32:64] (pk_seed || pk_root)"
+    },
+
+    "serialization": {
+      "qpub_base58": "Q1CFYH2UTfN9JFKBqZDAxgWXNmJ8287DiT2PGQWWsDTyVkRmSdc1F5WPVZsWArJC1jbt4DtM662BxdiE1EyWsqPKUNiacamqwcdkNepdrPLMro9DynXaSuirYhqncw2a4KQ1YxGidKXnxiB99xju8acUKtd",
+      "qprv_base58": "Q1FvGW9TBYu8BbJsKFZRbnxxNe4CVSzppdPRKXTeasFAAeEguA56NuhSVkLVFK8yrCU46rFSUbJXhxFToCKMGtEWoTVhTzQxXL2XYf86DECyJSGjzyFJDPQaaNFaoeK4kG19Lhy9z2nijjHojfFcoEhxefsp64V5JMRs2xCJRK6hkjy3x24EJZ3f1PmBm2uVD97mKYv",
+      "qpub_payload_size": 106,
+      "qprv_payload_size": 138
+    },
+
+    "child_addresses": {
+      "note": "Derived from qpub at child indices 0, 1, 2 (mainnet bech32m)",
+      "construction": "tr(child_xonly, qis(sphincs_pubkey, child_xonly))",
+      "index_0": "bc1pnn8g8wc69m4v56n6x4nxxfeaqdc060epv4d66s43ltq9n527e3nqt5307x",
+      "index_1": "bc1pnfd46jgj4fe33mk0jsah9v03xz4e7p5fmuycnknqe34dj0v9jp6szygxdl",
+      "index_2": "bc1prtky65r9pwweavqv5l2lapjhk5za85ahh7yv2d0tt2tn4jvtktqqmzg03x"
+    },
+
+    "child_derivation_invariant": "For all indices i: derive(qpub, i).sphincs_pubkey == qpub.sphincs_pubkey"
+  },
+
+  "format": {
+    "qpub_layout": "[4B version: 064a0000][1B depth][4B fingerprint][4B child#][32B chaincode][33B compressed_pubkey][32B sphincs_pubkey]",
+    "qprv_layout": "[4B version: 152c0000][1B depth][4B fingerprint][4B child#][32B chaincode][1B 0x00][32B privkey][64B sphincs_secret]",
+    "version_bytes": {
+      "mainnet_qpub": "064a0000",
+      "mainnet_qprv": "152c0000",
+      "mainnet_prefix": "Q1",
+      "testnet_qpub": "07200000",
+      "testnet_qprv": "18000000",
+      "testnet_prefix": "T4/T5"
+    },
+    "hybrid_script": "<sphincs_pk:32> OP_CHECKSPHINCSVERIFY(0xb3) OP_DROP(0x75) <child_xonly:32> OP_CHECKSIG(0xac)"
+  }
+}
